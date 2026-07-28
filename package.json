@@ -1,0 +1,23 @@
+{
+  "name": "evm-upgrade-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Hardhat verification suite for the mova-chain Prague EVM upgrade",
+  "scripts": {
+    "test": "hardhat test",
+    "test:local": "hardhat test --network local",
+    "test:node": "hardhat test --network localhost",
+    "node": "hardhat node",
+    "test:mova": "hardhat test --network mova",
+    "compile": "hardhat compile"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "hardhat": "^2.22.0"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^5.6.0",
+    "@uniswap/v4-core": "^1.0.2",
+    "dotenv": "^17.4.2"
+  }
+}

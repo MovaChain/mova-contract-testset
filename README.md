@@ -457,9 +457,23 @@ npx hardhat test --network local ./test/08-revert-refund.test.js
 ```env
 DEPLOY_PRIVATE_KEY=0x...   # Private key of a funded account
 RPC_URL=http://<host>:<port>
+SYSTEM_ADMIN_ADDRESS=0x... # Administrator of the fixed-address system contracts
 ```
 
 The local node runs with `hardfork: "osaka"`, Solidity `0.8.36`, and `evmVersion: "osaka"`.
+
+The system-contract tests attach to the blacklist at
+`0x000000000000000000000000000000000000B1AC` and SysConfig at
+`0x000000000000000000000000000000000000C0F1`. Blacklist tests compare the
+active signer with `SYSTEM_ADMIN_ADDRESS`. SysConfig tests verify that the
+configured account holds both AccessControl `DEFAULT_ADMIN_ROLE` and
+`ADMIN_ROLE`; an `ADMIN_ROLE` holder exercises successful writes, while a
+non-holder verifies that the same protected writes revert. Development
+networks without code at these fixed addresses skip the system-contract cases.
+`test/32-system-config-uups.test.js` deploys an isolated `SystemConfig` proxy,
+upgrades it from V1 to V2 with `UPGRADE_ROLE`, and verifies the implementation
+slot and namespaced configuration storage. It never upgrades the fixed-address
+system proxy.
 
 ---
 

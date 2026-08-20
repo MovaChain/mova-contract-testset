@@ -24,8 +24,10 @@ function header(title) {
 async function sendRaw(signer, txReq) {
   const isSocketError = (e) =>
     e?.message?.includes("SocketError") ||
+    e?.message?.includes("other side closed") ||
     e?.cause?.message?.includes("SocketError") ||
-    e?.code === "NETWORK_ERROR";
+    e?.code === "NETWORK_ERROR" ||
+    e?.code === "UND_ERR_SOCKET";
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -121,8 +123,10 @@ async function writeCall(contract, signer, method, args = [], gasLimit = 3_000_0
 async function deployWithRetry(factory, args = [], overrides = {}) {
   const isSocketError = (e) =>
     e?.message?.includes("SocketError") ||
+    e?.message?.includes("other side closed") ||
     e?.cause?.message?.includes("SocketError") ||
-    e?.code === "NETWORK_ERROR";
+    e?.code === "NETWORK_ERROR" ||
+    e?.code === "UND_ERR_SOCKET";
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {

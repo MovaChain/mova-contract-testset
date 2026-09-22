@@ -17,6 +17,9 @@ The suite verifies the following areas:
 3. Failed-transaction gas refund semantics are correct (`revert` charges only `gasUsed`; OOG charges the full amount).
 4. Modern contract standards and ecosystem interfaces (OZ 5.6 ERC-20/721/1155/2612, Chainlink AggregatorV3, Uniswap v4 PoolKey/StateLibrary, CREATE2, proxies, ECDSA, Multicall, and more) deploy and execute correctly.
 5. Block environment values (BASEFEE, PREVRANDAO, timestamp, and more) are injected with the correct on-chain values.
+6. EIP-7702 type-4 transactions work across gas estimation, simulation,
+   submission, consensus execution, receipt lookup, tracing, delegated account
+   state, and sponsored authorization flows.
 
 ---
 
@@ -365,6 +368,70 @@ Custom errors are the recommended modern contract error-handling approach and ar
 
 ---
 
+### Part 5: EIP-7702 Set-Code Transaction Validation
+
+#### 33 — EIP-7702 End-to-End Flow and Edge Cases
+
+**Contract** `contracts/EIP7702Probe.sol` (`EIP7702Probe`, `EIP7702ProbeV2`)
+**Test** `test/33-eip7702.test.js`
+
+This file tests EIP-7702 through the node's public JSON-RPC interface. It signs
+real type-4 transactions with ethers, sends the serialized transaction through
+`eth_sendRawTransaction`, waits for consensus execution, and verifies the
+resulting EVM account code, nonce, storage, receipt, transaction object, and
+trace. It is not an `eth_call`-only unit test.
+
+The two test accounts have different roles:
+
+- `DEPLOY_PRIVATE_KEY` is the funded payer and the authority in self-sponsored
+  cases. It deploys the probe contracts and pays transaction fees.
+- `EIP7702_AUTHORITY_PRIVATE_KEY` is a distinct authority used to prove that
+  one account can sign an authorization while another account submits the
+  transaction and pays the fee. The account should be present in the test
+  chain's genesis/state so its initial nonce is deterministic.
+
+`EIP7702Probe.answer()` returns 42, `contextAddress()` exposes the active EVM
+execution address, `store()` writes slot 0, and `fail()` deliberately reverts.
+`EIP7702ProbeV2.answer()` returns 43, making a successful redelegation directly
+observable.
+
+#### EIP-7702 test-case matrix
+
+| Test case (`it(...)`) | Scenario under test | Main assertions |
+|-----------------------|---------------------|-----------------|
+| `completes estimateGas, eth_call, send, execute, receipt lookup and trace` | Complete type-4 JSON-RPC lifecycle using a self-authorization. The same request is simulated, signed, submitted, mined, queried, and traced. | `eth_estimateGas` accepts `authorizationList`; `eth_call` returns 42; `eth_sendRawTransaction` succeeds; transaction and receipt type are `0x4`; the transaction contains one authorization; the authority code is `0xef0100 || implementation`; delegated execution returns 42; `debug_traceTransaction` returns a trace. |
+| `supports redelegation and sequential entries for the same authority` | Delegate to V1, redelegate to V2, then include two authorizations for the same authority in one transaction. | Redelegation changes the target; the final implementation returns 43; authorization entries are applied in list order; the authority nonce advances once per accepted authorization in addition to the outer transaction nonce increment. |
+| `ignores invalid nonce, chain ID and yParity without replacing existing delegation` | Submit authorizations with a future nonce, a non-matching authorization chain ID, and malformed `yParity=2`. The outer transaction itself remains correctly signed. | Each invalid authorization entry is ignored instead of replacing the existing V2 delegation; the outer type-4 transaction still executes successfully against the previous delegation. The malformed-yParity transaction is constructed at the RLP layer so it reaches node execution. |
+| `keeps an authorization when delegated execution reverts` | Authorize V1 and invoke `fail()` in the same type-4 transaction. | The receipt has `status=0`, but the authorization is not rolled back: the authority still contains the delegation designator targeting V1. The failed transaction can also be traced. |
+| `accepts wildcard chain IDs and accounts for access lists in estimateGas` | Sign the authorization with EIP-7702 wildcard chain ID 0 and compare estimates with and without an access-list entry. | Chain ID 0 authorization is accepted; the delegated call succeeds; the access-list request produces a larger estimate than the otherwise identical base request. |
+| `supports sponsored authorization and sponsored clearing` | A distinct authority signs an authorization, while `DEPLOY_PRIVATE_KEY` signs and pays for the outer type-4 transaction. A second sponsored transaction clears the delegation with target `address(0)`. | The authority delegates and executes `answer()` without being the outer sender; payer and authority nonces advance independently; the sponsored clear succeeds and restores the authority code to `0x`. |
+| `uses the authority address and storage as delegated execution context` | Execute V1 bytecode through the authority account and invoke both `contextAddress()` and `store(42)`. | `ADDRESS` resolves to the authority rather than the implementation; slot 0 is written on the authority; the implementation contract's own slot 0 remains zero. |
+| `allows delegation to an address with no code` | Authorize a target EOA/address whose code is empty. | The authorization is valid and the delegation designator is installed; calling the authority returns empty data instead of rejecting the authorization. |
+| `rejects low intrinsic gas, empty lists, RPC type mismatch and wrong outer chain` | Exercise type-4 envelope and RPC validation failures without mining a transaction. | The node rejects gas below intrinsic cost, a serialized type-4 transaction with an empty authorization list, `eth_estimateGas` with an empty list, a type-2 request carrying `authorizationList`, and a type-4 transaction signed for another outer chain ID. The payer nonce remains unchanged after every rejection. |
+
+For self-authorizations, the authorization nonce is the current outer
+transaction nonce plus one because the sender nonce is advanced before the
+authorization is applied. In the sponsored case, the authorization uses the
+distinct authority's current nonce. The test reads both values from the node
+before signing instead of assuming fixed genesis nonces.
+
+After every test case, the suite submits a valid zero-address authorization to
+remove any delegation from both test accounts. This keeps cases independent
+and prevents a failed case from silently changing the behavior of later test
+files.
+
+The EIP-7702 suite targets an external node selected by the Hardhat `local`
+network and is skipped on Hardhat's in-process network. Run it with:
+
+```bash
+RPC_URL=http://127.0.0.1:9545 \
+DEPLOY_PRIVATE_KEY=0x... \
+EIP7702_AUTHORITY_PRIVATE_KEY=0x... \
+npm run test:eip7702
+```
+
+---
+
 ## Directory Structure
 
 ```
@@ -397,7 +464,8 @@ evm-upgrade-tests/
 │   ├── CustomErrorProbe.sol
 │   ├── AccessControlProbe.sol
 │   ├── TimelockProbe.sol
-│   └── MulticallProbe.sol
+│   ├── MulticallProbe.sol
+│   └── EIP7702Probe.sol
 ├── test/
 │   ├── _helpers.js          # Shared utilities such as sendRaw / writeCall
 │   ├── 01-push0.test.js
@@ -427,7 +495,12 @@ evm-upgrade-tests/
 │   ├── 25-multicall.test.js
 │   ├── 26-erc1155.test.js
 │   ├── 27-chainlink.test.js
-│   └── 28-uniswap-v4.test.js
+│   ├── 28-uniswap-v4.test.js
+│   ├── 29-eip8051.test.js
+│   ├── 30-system-blacklist.test.js
+│   ├── 31-system-config.test.js
+│   ├── 32-system-config-uups.test.js
+│   └── 33-eip7702.test.js
 ├── hardhat.config.js
 └── package.json
 ```
@@ -450,12 +523,15 @@ npm run test:node
 npx hardhat test --network local
 # Or run an individual test file
 npx hardhat test --network local ./test/08-revert-refund.test.js
+# Run only the EIP-7702 end-to-end scenarios
+npm run test:eip7702
 ```
 
 **`.env` configuration**:
 
 ```env
 DEPLOY_PRIVATE_KEY=0x...   # Private key of a funded account
+EIP7702_AUTHORITY_PRIVATE_KEY=0x... # A distinct account for sponsored authorization
 RPC_URL=http://<host>:<port>
 SYSTEM_ADMIN_ADDRESS=0x... # Administrator of the fixed-address system contracts
 ```
@@ -467,13 +543,16 @@ The system-contract tests attach to the blacklist at
 `0x000000000000000000000000000000000000C0F1`. Blacklist tests compare the
 active signer with `SYSTEM_ADMIN_ADDRESS`. SysConfig tests verify that the
 configured account holds both AccessControl `DEFAULT_ADMIN_ROLE` and
-`ADMIN_ROLE`; an `ADMIN_ROLE` holder exercises successful writes, while a
+`CONFIG_ADMIN_ROLE`; a `CONFIG_ADMIN_ROLE` holder exercises successful writes, while a
 non-holder verifies that the same protected writes revert. Development
 networks without code at these fixed addresses skip the system-contract cases.
 `test/32-system-config-uups.test.js` deploys an isolated `SystemConfig` proxy,
 upgrades it from V1 to V2 with `UPGRADE_ROLE`, and verifies the implementation
 slot and namespaced configuration storage. It never upgrades the fixed-address
 system proxy.
+
+See **Part 5: EIP-7702 Set-Code Transaction Validation** for the detailed
+mapping between every test case and the scenario it validates.
 
 ---
 
@@ -493,6 +572,7 @@ system proxy.
 | 09–11 Osaka | CLZ/P256VERIFY/ModExp unavailable or incorrect. | Execute correctly. |
 | 12 EIP-7907 | Runtime code above 24 KB is rejected. | A 40,000-byte runtime deploys successfully. |
 | 13–28 Standards and ecosystem contracts | Solidity 0.8.x / standard interfaces fail to deploy or behave incorrectly. | OZ 5.6, Chainlink, and Uniswap v4 compatibility paths all work correctly. |
+| 33 EIP-7702 | Type-4 transactions are rejected or authorization lists are ignored. | Estimation, submission, execution, tracing, delegation updates and sponsored authorization work end to end. |
 
 | Validation scope | Contents | Result |
 |------------------|----------|--------|
@@ -501,3 +581,4 @@ system proxy.
 | General contract capabilities | Deep reverts, CREATE2, Proxy/DELEGATECALL upgrades, ECDSA/EIP-712, custom errors, reentrancy protection, Timelock, Multicall | Passed |
 | OZ 5.6 standard contracts | ERC-20, ERC-721, ERC-1155, ERC-20 Permit/EIP-2612 | Passed |
 | DeFi/oracles | Constant-product AMM, Chainlink AggregatorV3 mock and consumer price normalization/fallback for invalid prices | Passed |
+| EIP-7702 account delegation | Type-4 RPC lifecycle, authorization validation, redelegation/clearing, sponsored transactions, delegated address/storage context, tracing | Passed |

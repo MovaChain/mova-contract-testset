@@ -16,7 +16,9 @@ const CONFIG_TYPE_NONE = 0n;
 const CONFIG_TYPE_UINT = 2n;
 const TX_GAS = 500_000n;
 const DEFAULT_ADMIN_ROLE = ethers.ZeroHash;
-const ADMIN_ROLE = ethers.id("ADMIN_ROLE");
+// The chain predeploy uses CONFIG_ADMIN_ROLE. This differs from the older
+// standalone test implementation, which called the same role ADMIN_ROLE.
+const ADMIN_ROLE = ethers.id("CONFIG_ADMIN_ROLE");
 
 function decodeUint(item) {
   expect(item.valueType).to.equal(CONFIG_TYPE_UINT);
@@ -44,7 +46,7 @@ describe("System contract — SysConfig", function () {
   });
 
   it("reports the configured AccessControl administrator roles", async function () {
-    header("hasRole(DEFAULT_ADMIN_ROLE / ADMIN_ROLE)");
+    header("hasRole(DEFAULT_ADMIN_ROLE / CONFIG_ADMIN_ROLE)");
     const configuredHasDefaultAdmin = await accessControl.hasRole(
       DEFAULT_ADMIN_ROLE,
       adminAddress
@@ -57,8 +59,8 @@ describe("System contract — SysConfig", function () {
 
     row("configured admin", adminAddress);
     row("configured DEFAULT_ADMIN_ROLE", configuredHasDefaultAdmin);
-    row("configured ADMIN_ROLE", configuredHasAdmin);
-    row("current user ADMIN_ROLE", currentUserHasAdmin);
+    row("configured CONFIG_ADMIN_ROLE", configuredHasAdmin);
+    row("current user CONFIG_ADMIN_ROLE", currentUserHasAdmin);
 
     expect(configuredHasDefaultAdmin).to.equal(true);
     expect(configuredHasAdmin).to.equal(true);

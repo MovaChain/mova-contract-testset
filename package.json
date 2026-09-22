@@ -6,7 +6,8 @@
   "scripts": {
     "test": "hardhat test",
     "test:local": "hardhat test --network local",
-    "test:eip7702": "hardhat test test/33-eip7702.test.js --network local",
+    "test:eip7702": "hardhat test test/33-eip7702.test.js test/34-eip7702-advanced.test.js --network local",
+    "test:eip7702:smoke": "hardhat test test/33-eip7702.test.js --network local",
     "test:node": "hardhat test --network localhost",
     "node": "hardhat node",
     "test:mova": "hardhat test --network mova",

@@ -27,6 +27,22 @@ function authorizationJson(auth) {
   };
 }
 
+function type4CallJson(request) {
+  return {
+    type: "0x4",
+    from: request.from,
+    to: request.to,
+    nonce: quantity(request.nonce),
+    value: quantity(request.value ?? 0n),
+    data: request.data ?? "0x",
+    gas: quantity(request.gasLimit ?? TX_GAS),
+    maxPriorityFeePerGas: quantity(request.maxPriorityFeePerGas ?? 0n),
+    maxFeePerGas: quantity(request.maxFeePerGas ?? FEE_CAP),
+    accessList: request.accessList ?? [],
+    authorizationList: request.authorizationList.map(authorizationJson),
+  };
+}
+
 function delegatedTarget(code) {
   if (!code.toLowerCase().startsWith(DELEGATION_PREFIX) || ethers.dataLength(code) !== 23) {
     return null;
@@ -69,6 +85,37 @@ async function sendType4(wallet, request) {
   const raw = await rawType4(wallet, request);
   const hash = await ethers.provider.send("eth_sendRawTransaction", [raw]);
   return { raw, hash, receipt: await waitReceipt(hash) };
+}
+
+function errorText(error) {
+  return [error?.shortMessage, error?.reason, error?.message, error?.info?.error?.message]
+    .filter(Boolean)
+    .join(" | ");
+}
+
+async function expectValidationFailure(action) {
+  try {
+    await action();
+    expect.fail("expected the node to reject the request");
+  } catch (error) {
+    const message = errorText(error);
+    expect(message).not.to.match(/ECONN|network error|timeout|socket hang up/i);
+    expect(message).to.match(/invalid|intrinsic|authorization|chain|type|empty|rlp|decode|gas/i);
+    return message;
+  }
+}
+
+function expectCallTrace(trace, { from, to, input, failed = false }) {
+  expect(trace).to.be.an("object");
+  expect(trace.from.toLowerCase()).to.equal(from.toLowerCase());
+  expect(trace.to.toLowerCase()).to.equal(to.toLowerCase());
+  expect(trace.input.toLowerCase()).to.equal(input.toLowerCase());
+  expect(trace.output).to.be.a("string");
+  if (failed) {
+    expect(trace.error || trace.revertReason).to.be.a("string").and.not.empty;
+  } else {
+    expect(trace.error).to.equal(undefined);
+  }
 }
 
 // Ethers intentionally refuses to construct an invalid Signature. Build the
@@ -145,8 +192,8 @@ describe("EIP-7702 — set-code transactions", function () {
   }
 
   afterEach(async function () {
-    await clearDelegation(payer).catch(() => {});
-    await clearDelegation(sponsoredAuthority, payer).catch(() => {});
+    await clearDelegation(payer);
+    await clearDelegation(sponsoredAuthority, payer);
   });
 
   it("completes estimateGas, eth_call, send, execute, receipt lookup and trace", async function () {
@@ -166,9 +213,13 @@ describe("EIP-7702 — set-code transactions", function () {
       accessList: [],
       authorizationList: [auth],
     };
+    // JSON-RPC quantity fields must use minimal hex encoding. In particular,
+    // ethers signatures keep r/s as 32-byte values and may randomly start
+    // with 0x00, which strict hexutil decoders correctly reject.
+    const rpcRequest = type4CallJson(request);
 
-    const estimate = await ethers.provider.estimateGas(request);
-    const simulated = await ethers.provider.call(request);
+    const estimate = BigInt(await ethers.provider.send("eth_estimateGas", [rpcRequest]));
+    const simulated = await ethers.provider.send("eth_call", [rpcRequest, "latest"]);
     const { hash, receipt } = await sendType4(payer, request);
     const transaction = await ethers.provider.send("eth_getTransactionByHash", [hash]);
     const rpcReceipt = await ethers.provider.send("eth_getTransactionReceipt", [hash]);
@@ -191,7 +242,7 @@ describe("EIP-7702 — set-code transactions", function () {
     expect(transaction.authorizationList).to.have.length(1);
     expect(delegatedTarget(code)).to.equal(probeAddress);
     expect(await delegated.answer()).to.equal(42n);
-    expect(trace).to.be.an("object");
+    expectCallTrace(trace, { from: payer.address, to: payer.address, input: data });
   });
 
   it("supports redelegation and sequential entries for the same authority", async function () {
@@ -215,6 +266,7 @@ describe("EIP-7702 — set-code transactions", function () {
       authorizationList: [toV2],
     });
     expect(result.receipt.status).to.equal(1);
+    expect(await ethers.provider.getTransactionCount(payer.address, "latest")).to.equal(nonce + 2);
     expect(delegatedTarget(await ethers.provider.getCode(payer.address))).to.equal(probeV2Address);
 
     nonce = await ethers.provider.getTransactionCount(payer.address, "latest");
@@ -257,6 +309,7 @@ describe("EIP-7702 — set-code transactions", function () {
       authorizationList: [auth],
     });
     expect(result.receipt.status).to.equal(1);
+    expect(await ethers.provider.getTransactionCount(payer.address, "latest")).to.equal(nonce + 1);
     expect(delegatedTarget(await ethers.provider.getCode(payer.address))).to.equal(probeV2Address);
 
     nonce = await ethers.provider.getTransactionCount(payer.address, "latest");
@@ -268,6 +321,7 @@ describe("EIP-7702 — set-code transactions", function () {
       authorizationList: [auth],
     });
     expect(result.receipt.status).to.equal(1);
+    expect(await ethers.provider.getTransactionCount(payer.address, "latest")).to.equal(nonce + 1);
     expect(delegatedTarget(await ethers.provider.getCode(payer.address))).to.equal(probeV2Address);
 
     nonce = await ethers.provider.getTransactionCount(payer.address, "latest");
@@ -285,17 +339,20 @@ describe("EIP-7702 — set-code transactions", function () {
     row("invalid yParity tx", hash);
     row("retained target", delegatedTarget(await ethers.provider.getCode(payer.address)));
     expect(receipt.status).to.equal(1);
+    expect(await ethers.provider.getTransactionCount(payer.address, "latest")).to.equal(nonce + 1);
     expect(delegatedTarget(await ethers.provider.getCode(payer.address))).to.equal(probeV2Address);
   });
 
   it("keeps an authorization when delegated execution reverts", async function () {
     header("authorization survives call revert");
+    const valueBefore = await ethers.provider.getStorage(payer.address, 0);
     const nonce = await ethers.provider.getTransactionCount(payer.address, "latest");
     const auth = await signedAuthorization(payer, probeAddress, nonce + 1, chainId);
+    const data = probe.interface.encodeFunctionData("storeThenRevert", [987654321n]);
     const { hash, receipt } = await sendType4(payer, {
       nonce,
       to: payer.address,
-      data: probe.interface.encodeFunctionData("fail"),
+      data,
       authorizationList: [auth],
     });
     const trace = await ethers.provider.send("debug_traceTransaction", [hash, { tracer: "callTracer" }]);
@@ -304,7 +361,10 @@ describe("EIP-7702 — set-code transactions", function () {
     row("delegation retained", delegatedTarget(await ethers.provider.getCode(payer.address)));
     expect(receipt.status).to.equal(0);
     expect(delegatedTarget(await ethers.provider.getCode(payer.address))).to.equal(probeAddress);
-    expect(trace).to.be.an("object");
+    expect(await ethers.provider.getTransactionCount(payer.address, "latest")).to.equal(nonce + 2);
+    expect(await ethers.provider.getStorage(payer.address, 0)).to.equal(valueBefore);
+    expect(receipt.logs).to.have.length(0);
+    expectCallTrace(trace, { from: payer.address, to: payer.address, input: data, failed: true });
   });
 
   it("accepts wildcard chain IDs and accounts for access lists in estimateGas", async function () {
@@ -323,11 +383,12 @@ describe("EIP-7702 — set-code transactions", function () {
       authorizationList: [wildcard],
       accessList: [],
     };
-    const baseEstimate = await ethers.provider.estimateGas(base);
-    const accessEstimate = await ethers.provider.estimateGas({
-      ...base,
+    const rpcBase = type4CallJson(base);
+    const baseEstimate = BigInt(await ethers.provider.send("eth_estimateGas", [rpcBase]));
+    const accessEstimate = BigInt(await ethers.provider.send("eth_estimateGas", [{
+      ...rpcBase,
       accessList: [{ address: probeAddress, storageKeys: [ethers.zeroPadValue("0x01", 32)] }],
-    });
+    }]));
     const { receipt } = await sendType4(payer, base);
 
     row("base estimate", baseEstimate.toString());
@@ -427,20 +488,20 @@ describe("EIP-7702 — set-code transactions", function () {
       gasLimit: LOW_GAS,
       authorizationList: [auth],
     });
-    await expect(
+    await expectValidationFailure(() =>
       ethers.provider.send("eth_sendRawTransaction", [lowGasRaw])
-    ).to.be.rejected;
+    );
 
     const emptyRaw = await rawType4(payer, {
       nonce,
       to: payer.address,
       authorizationList: [],
     });
-    await expect(
+    await expectValidationFailure(() =>
       ethers.provider.send("eth_sendRawTransaction", [emptyRaw])
-    ).to.be.rejected;
+    );
 
-    await expect(
+    await expectValidationFailure(() =>
       ethers.provider.send("eth_estimateGas", [{
         type: "0x4",
         from: payer.address,
@@ -448,9 +509,9 @@ describe("EIP-7702 — set-code transactions", function () {
         gas: quantity(TX_GAS),
         authorizationList: [],
       }])
-    ).to.be.rejected;
+    );
 
-    await expect(
+    await expectValidationFailure(() =>
       ethers.provider.send("eth_estimateGas", [{
         type: "0x2",
         from: payer.address,
@@ -458,7 +519,7 @@ describe("EIP-7702 — set-code transactions", function () {
         gas: quantity(TX_GAS),
         authorizationList: [authorizationJson(auth)],
       }])
-    ).to.be.rejected;
+    );
 
     const wrongChainRaw = await rawType4(payer, {
       chainId: chainId + 1n,
@@ -466,9 +527,9 @@ describe("EIP-7702 — set-code transactions", function () {
       to: payer.address,
       authorizationList: [auth],
     });
-    await expect(
+    await expectValidationFailure(() =>
       ethers.provider.send("eth_sendRawTransaction", [wrongChainRaw])
-    ).to.be.rejected;
+    );
 
     row("sender nonce unchanged", await ethers.provider.getTransactionCount(payer.address, "latest"));
     expect(await ethers.provider.getTransactionCount(payer.address, "latest")).to.equal(nonce);

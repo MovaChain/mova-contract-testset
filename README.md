@@ -372,8 +372,8 @@ Custom errors are the recommended modern contract error-handling approach and ar
 
 #### 33 — EIP-7702 End-to-End Flow and Edge Cases
 
-**Contract** `contracts/EIP7702Probe.sol` (`EIP7702Probe`, `EIP7702ProbeV2`)
-**Test** `test/33-eip7702.test.js`
+**Contract** `contracts/EIP7702Probe.sol` (`EIP7702Probe`, `EIP7702ProbeV2`, `EIP7702CallHarness`)
+**Tests** `test/33-eip7702.test.js`, `test/34-eip7702-advanced.test.js`
 
 This file tests EIP-7702 through the node's public JSON-RPC interface. It signs
 real type-4 transactions with ethers, sends the serialized transaction through
@@ -390,24 +390,43 @@ The two test accounts have different roles:
   transaction and pays the fee. The account should be present in the test
   chain's genesis/state so its initial nonce is deterministic.
 
-`EIP7702Probe.answer()` returns 42, `contextAddress()` exposes the active EVM
-execution address, `store()` writes slot 0, and `fail()` deliberately reverts.
+`EIP7702Probe` provides deterministic return values, state writes, events,
+execution-context inspection, code inspection, and REVERT/INVALID/OOG paths.
 `EIP7702ProbeV2.answer()` returns 43, making a successful redelegation directly
-observable.
+observable. `EIP7702CallHarness` drives CALL, STATICCALL, DELEGATECALL and
+CALLCODE and independently inspects EXTCODE* behavior.
 
 #### EIP-7702 test-case matrix
 
 | Test case (`it(...)`) | Scenario under test | Main assertions |
 |-----------------------|---------------------|-----------------|
-| `completes estimateGas, eth_call, send, execute, receipt lookup and trace` | Complete type-4 JSON-RPC lifecycle using a self-authorization. The same request is simulated, signed, submitted, mined, queried, and traced. | `eth_estimateGas` accepts `authorizationList`; `eth_call` returns 42; `eth_sendRawTransaction` succeeds; transaction and receipt type are `0x4`; the transaction contains one authorization; the authority code is `0xef0100 || implementation`; delegated execution returns 42; `debug_traceTransaction` returns a trace. |
+| `completes estimateGas, eth_call, send, execute, receipt lookup and trace` | Complete type-4 JSON-RPC lifecycle using a self-authorization. The same request is simulated, signed, submitted, mined, queried, and traced. | `eth_estimateGas` accepts `authorizationList`; `eth_call` returns 42; submission succeeds; transaction and receipt type are `0x4`; the authority code is `0xef0100 || implementation`; trace `from`, `to`, `input`, `output`, and success state match the transaction. |
 | `supports redelegation and sequential entries for the same authority` | Delegate to V1, redelegate to V2, then include two authorizations for the same authority in one transaction. | Redelegation changes the target; the final implementation returns 43; authorization entries are applied in list order; the authority nonce advances once per accepted authorization in addition to the outer transaction nonce increment. |
-| `ignores invalid nonce, chain ID and yParity without replacing existing delegation` | Submit authorizations with a future nonce, a non-matching authorization chain ID, and malformed `yParity=2`. The outer transaction itself remains correctly signed. | Each invalid authorization entry is ignored instead of replacing the existing V2 delegation; the outer type-4 transaction still executes successfully against the previous delegation. The malformed-yParity transaction is constructed at the RLP layer so it reaches node execution. |
-| `keeps an authorization when delegated execution reverts` | Authorize V1 and invoke `fail()` in the same type-4 transaction. | The receipt has `status=0`, but the authorization is not rolled back: the authority still contains the delegation designator targeting V1. The failed transaction can also be traced. |
+| `ignores invalid nonce, chain ID and yParity without replacing existing delegation` | Submit authorizations with a future nonce, a non-matching authorization chain ID, and malformed `yParity=2`. The outer transaction itself remains correctly signed. | Each invalid tuple is ignored, the existing target is retained, and the authority nonce advances only for the outer self-sponsored transaction—not for the rejected authorization. |
+| `keeps an authorization when delegated execution reverts` | Authorize V1 and invoke `storeThenRevert()` in the same type-4 transaction. | The delegation and authorization nonce survive, while the attempted storage write and log are rolled back. The failed trace contains the expected endpoints, calldata, output, and error. |
 | `accepts wildcard chain IDs and accounts for access lists in estimateGas` | Sign the authorization with EIP-7702 wildcard chain ID 0 and compare estimates with and without an access-list entry. | Chain ID 0 authorization is accepted; the delegated call succeeds; the access-list request produces a larger estimate than the otherwise identical base request. |
 | `supports sponsored authorization and sponsored clearing` | A distinct authority signs an authorization, while `DEPLOY_PRIVATE_KEY` signs and pays for the outer type-4 transaction. A second sponsored transaction clears the delegation with target `address(0)`. | The authority delegates and executes `answer()` without being the outer sender; payer and authority nonces advance independently; the sponsored clear succeeds and restores the authority code to `0x`. |
 | `uses the authority address and storage as delegated execution context` | Execute V1 bytecode through the authority account and invoke both `contextAddress()` and `store(42)`. | `ADDRESS` resolves to the authority rather than the implementation; slot 0 is written on the authority; the implementation contract's own slot 0 remains zero. |
 | `allows delegation to an address with no code` | Authorize a target EOA/address whose code is empty. | The authorization is valid and the delegation designator is installed; calling the authority returns empty data instead of rejecting the authorization. |
-| `rejects low intrinsic gas, empty lists, RPC type mismatch and wrong outer chain` | Exercise type-4 envelope and RPC validation failures without mining a transaction. | The node rejects gas below intrinsic cost, a serialized type-4 transaction with an empty authorization list, `eth_estimateGas` with an empty list, a type-2 request carrying `authorizationList`, and a type-4 transaction signed for another outer chain ID. The payer nonce remains unchanged after every rejection. |
+| `rejects low intrinsic gas, empty lists, RPC type mismatch and wrong outer chain` | Exercise type-4 envelope and RPC validation failures without mining a transaction. | The node returns a validation-class error (not merely any rejected Promise), rejects every malformed request, and leaves payer state unchanged. |
+
+#### Advanced EIP-7702 test-case matrix
+
+| Test case (`it(...)`) | Scenario under test | Main assertions |
+|-----------------------|---------------------|-----------------|
+| `continues through mixed invalid and valid entries, including multiple authorities` | One list contains an invalid future-nonce entry followed by valid entries for two other authorities. | Processing continues after the invalid entry; only valid authorities change code and nonce; payer advances once. |
+| `applies later valid entries after an invalid entry for the same authority` | `[invalid nonce, valid nonce 0, valid nonce 1]` for one authority. | The invalid entry is skipped and both later entries apply in order; final target is V2 and authority nonce is 2. |
+| `ignores duplicate authorizations and cross-transaction replays without incrementing authority nonce` | Repeat the exact signed tuple in one list and submit it again in a later transaction. | The tuple applies once; both duplicate and replay are ignored without another authority nonce increment. |
+| `uses an installed delegation from a later ordinary type-2 transaction` | Install delegation with sponsored type-4, then let the authority send an ordinary EIP-1559 transaction to itself. | The type-2 transaction executes delegated bytecode, changes authority storage, and consumes only its ordinary sender nonce. |
+| `uses an installed delegation from a later ordinary legacy transaction` | Repeat the previous reuse flow with a legacy EIP-155 transaction. | Distinguishes delegated-account reuse from type-2 envelope support: the early Mova transaction stack can execute the delegation from a normal legacy transaction. |
+| `preserves authority context across CALL and uses caller context for DELEGATECALL and CALLCODE` | Invoke the delegated account through CALL, STATICCALL, DELEGATECALL, and CALLCODE. | CALL writes authority storage; STATICCALL reads successfully but rejects writes; DELEGATECALL and CALLCODE write harness storage. |
+| `exposes the designation to EXTCODE operations but implementation bytes to CODE operations` | Compare EXTCODESIZE/COPY/HASH on the authority with CODESIZE/CODECOPY during delegated execution. | EXTCODE* sees the 23-byte designation; executing CODE* sees the implementation runtime bytecode. |
+| `reports sender, origin, value, balance, storage and event address in delegated execution` | Pay value while executing `observe()` through a freshly delegated authority. | `address(this)` and event address are the authority; sender/origin are the payer; value, balance, storage, and event fields agree. |
+| `preserves storage and balance across redelegation, clearing and reauthorization` | Write state, switch implementation, clear code, then delegate again. | Clearing only removes code; authority storage, balance, and monotonically increasing nonce remain intact. |
+| `retains authorization while reverting INVALID and out-of-gas execution` | Execute INVALID and an infinite loop with bounded gas immediately after authorization. | Both receipts fail, but delegation code and the accepted authorization nonce remain committed. |
+| `handles chained, self, cyclic and precompile delegation targets without recursive resolution` | Configure `A -> B -> implementation`, a self pointer, a two-account cycle, and an authority targeting precompile `0x01`. | Every designation is installed, but execution follows at most one pointer; self/cyclic designations cannot recurse and a delegated precompile address does not turn the authority into that precompile. |
+| `charges every authorization entry and applies the existing-account refund` | Compare one vs two invalid entries and valid vs invalid authorization for an existing authority. | Every entry adds Mova's configured 25,000 intrinsic gas, including invalid entries; a valid existing-account authorization receives the configured refund. |
+| `rejects signature, integer, address, creation and non-canonical RLP boundaries atomically` | Test r=0, s=0, high-s, nonce = 2^64-1, nonce >= 2^64, 19-byte address, `to=null`, and non-canonical integer encoding. | Bad authorization signatures and the reserved maximum uint64 nonce are skipped; out-of-range fields and malformed transaction encodings are rejected atomically. |
 
 For self-authorizations, the authorization nonce is the current outer
 transaction nonce plus one because the sender nonce is advanced before the
@@ -416,12 +435,22 @@ distinct authority's current nonce. The test reads both values from the node
 before signing instead of assuming fixed genesis nonces.
 
 After every test case, the suite submits a valid zero-address authorization to
-remove any delegation from both test accounts. This keeps cases independent
-and prevents a failed case from silently changing the behavior of later test
-files.
+remove every delegation it created. Cleanup errors are deliberately not
+swallowed: a cleanup failure fails the test run instead of contaminating later
+cases. Storage is expected to survive code clearing, so state-writing tests use
+fresh authorities or values derived from the observed pre-state.
+
+The type-2 reuse case is deliberately a compatibility gate. It must not fall
+back to a legacy transaction: builds that only decode legacy and type-4
+envelopes will fail it with an RLP/decode error, while the adjacent legacy case
+continues to prove that an installed delegation remains usable by an ordinary
+transaction.
 
 The EIP-7702 suite targets an external node selected by the Hardhat `local`
-network and is skipped on Hardhat's in-process network. Run it with:
+network and is skipped on Hardhat's in-process network. Consequently, a plain
+`npm test` reports these cases as pending and is **not** evidence that EIP-7702
+passed. CI and release validation must run `npm run test:eip7702`, which selects
+both files explicitly and fails when the RPC URL or required keys are missing:
 
 ```bash
 RPC_URL=http://127.0.0.1:9545 \
@@ -500,7 +529,8 @@ evm-upgrade-tests/
 │   ├── 30-system-blacklist.test.js
 │   ├── 31-system-config.test.js
 │   ├── 32-system-config-uups.test.js
-│   └── 33-eip7702.test.js
+│   ├── 33-eip7702.test.js
+│   └── 34-eip7702-advanced.test.js
 ├── hardhat.config.js
 └── package.json
 ```
